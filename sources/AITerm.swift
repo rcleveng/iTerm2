@@ -6,6 +6,19 @@ protocol AITermControllerDelegate: AnyObject {
                                              completion: @escaping (AITermController.Registration) -> ())
 }
 
+extension Data {
+    var prettyPrintedJSONString: NSString? {
+        guard let jsonObject = try? JSONSerialization.jsonObject(with: self, options: []),
+              let data = try? JSONSerialization.data(withJSONObject: jsonObject,
+                                                       options: [.prettyPrinted]),
+              let prettyJSON = NSString(data: data, encoding: String.Encoding.utf8.rawValue) else {
+                  return nil
+               }
+
+        return prettyJSON
+    }
+}
+
 fileprivate func openAIModelIsLegacy(model: String) -> Bool {
     return !model.hasPrefix("gpt-")
 }
@@ -606,7 +619,7 @@ class AITermController {
         let maybeDecls = functions.isEmpty ? nil : functions.map { $0.decl }
         let contents = messages.filter{ $0.content != nil }.map { GeminiContent.init(text: $0.content!) }
         let body = GeminiBody(contents: contents)
-        print("REQUEST:\n\(body)")
+        //print("REQUEST:\n\(body)")
         let bodyEncoder = JSONEncoder()
         let bodyData = try! bodyEncoder.encode(body)
         return bodyData
@@ -656,6 +669,7 @@ class AITermController {
         let model = iTermPreferences.string(forKey: kPreferenceKeyAIModel) ?? "gpt-3.5-turbo"
         return url(forModel: model)
     }
+
     
     private func makeAPICall(messages: [Message], registration: Registration, format: AIFormat) {
         let model = iTermPreferences.string(forKey: kPreferenceKeyAIModel) ?? "gpt-3.5-turbo"
@@ -683,7 +697,8 @@ class AITermController {
         let bodyData = requestBody(model: model, messages: messages, format: format)
         request.httpBody = bodyData
         print("REQUEST:\n\(request)")
-        print("REQUEST BODY:\n\(bodyData)")
+        let debugOut = bodyData.prettyPrintedJSONString ?? "Couldn't create a .json string."
+        print("REQUEST BODY:\n\(debugOut)")
         let format = getFormat(model)
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
@@ -815,7 +830,8 @@ class AITermController {
     private func parseGeminiResponse(data: Data) throws -> [String]? {
         let decoder = JSONDecoder()
         let response =  try decoder.decode(GeminiGenerateContentResponse.self, from: data)
-        print("RESPONSE:\n\(response)")
+        let debugOut = data.prettyPrintedJSONString ?? "unable to parse response"
+        print("RESPONSE:\n\(debugOut)")
         for c in response.candidates {
             for p in c.content.parts {
                 if p.text != nil {
