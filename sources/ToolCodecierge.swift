@@ -1236,6 +1236,9 @@ class OpenAIMetadata: NSObject {
         Model(name: "gpt-3.5-turbo",
               contextWindowTokens: 16384,
               maxResponseTokens: 4096),
+        Model(name: "gemini-pro",
+              contextWindowTokens: 8192,
+              maxResponseTokens: 4096),
         ]
 
     @objc(enumerateModels:) func enumerateModels(_ closure: (String, Int) -> ()) {

@@ -306,13 +306,13 @@ class AITermController {
     func request(query: String) {
         precondition(state == .ground)
         state = .initialized(query: query)
-        handle(event: .begin, legacy: false)
+        handle(event: .begin, format: getDefaultFormat())
     }
 
     func request(messages: [Message]) {
         precondition(state == .ground)
         state = .initializedMessages(messages: messages)
-        handle(event: .begin, legacy: false)
+        handle(event: .begin, format: getDefaultFormat())
     }
 
     func define<T: Codable>(function decl: ChatGPTFunctionDeclaration, arguments: T.Type, implementation: @escaping Function<T>.Impl) {
@@ -322,8 +322,14 @@ class AITermController {
     fileprivate func define(functions: [AnyFunction]) {
         self.functions.append(contentsOf: functions)
     }
+    
+    enum AIFormat {
+        case openai_legacy
+        case openai_modern
+        case google_gemini_10
+    }
 
-    private func handle(event: Event, legacy: Bool) {
+    private func handle(event: Event, format: AIFormat) {
         DLog("handle(\(event)) in state \(state)")
         switch state {
         case .ground:
@@ -334,11 +340,11 @@ class AITermController {
             switch event {
             case .begin:
                 guard let registration else {
-                    requestRegistration(continuation: state)
+                    requestRegistration(continuation: state, format: format)
                     return
                 }
                 DispatchQueue.main.async { [self] in
-                    makeAPICall(query: query, registration: registration)
+                    makeAPICall(query: query, registration: registration, format: format)
                 }
                 delegate?.aitermControllerWillSendRequest(self)
             case .error(reason: let reason):
@@ -353,11 +359,11 @@ class AITermController {
             switch event {
             case .begin:
                 guard let registration else {
-                    requestRegistration(continuation: state)
+                    requestRegistration(continuation: state, format: format)
                     return
                 }
                 DispatchQueue.main.async { [self] in
-                    makeAPICall(messages: messages, registration: registration)
+                    makeAPICall(messages: messages, registration: registration, format: format)
                 }
                 delegate?.aitermControllerWillSendRequest(self)
             case .error(reason: let reason):
@@ -375,16 +381,17 @@ class AITermController {
             case .apiResponse(data: let data, response: _, error: let error):
                 DLog("Unexpected event \(event) in \(state)")
                 if let error {
-                    handle(event: .error(reason: "HTTP error from server: \(error)"), legacy: false)
+                    handle(event: .error(reason: "HTTP error from server: \(error)"), format: .openai_modern)
                     return
                 }
                 guard let data else {
-                    handle(event: .error(reason: "Neither error nor data. This shouldn't happen."), legacy: false)
+                    handle(event: .error(reason: "Neither error nor data. This shouldn't happen."), format: .openai_modern)
                     return
                 }
-                parseResponse(data: data, legacy: legacy)
+                parseResponse(data: data, format: format)
             case .error(reason: let reason):
                 DLog("error: \(reason)")
+                print("error: \(reason)")
                 state = .ground
                 let provider =
                     if usingOpenAI {
@@ -400,17 +407,27 @@ class AITermController {
     func hostIsOpenAIAPI(url: URL?) -> Bool {
         return url?.host == "api.openai.com"
     }
+    
+    func hostIsGeminiAPI(url: URL?) -> Bool {
+        return url?.host == "generativelanguage.googleapis.com"
+    }
+    
+
 
     var usingOpenAI: Bool {
         return hostIsOpenAIAPI(url: modelURL)
     }
+    
+    var usingGemini: Bool {
+        return hostIsGeminiAPI(url: modelURL)
+    }
 
-    private func requestRegistration(continuation: State) {
+    private func requestRegistration(continuation: State, format: AIFormat) {
         state = .ground
         delegate?.aitermControllerRequestRegistration(self) { [weak self] registration in
             self?.registration = registration
             self?.state = continuation
-            self?.handle(event: .begin, legacy: false)
+            self?.handle(event: .begin, format: format)
         }
     }
 
@@ -495,6 +512,62 @@ class AITermController {
 
         var approximateTokenCount: Int { OpenAIMetadata.instance.tokens(in: (content ?? "")) + 1 }
     }
+    
+    struct GeminiPart: Codable, Equatable {
+        var text: String?
+    }
+    
+    struct GeminiContent: Codable, Equatable {
+        
+        var role = "user"
+        var parts = [GeminiPart]()
+
+        // For function calling
+        var name: String?
+        var function_call: FunctionCall?
+        
+        init(text: String) {
+            self.parts.append(GeminiPart(text: text))
+        }
+
+        struct FunctionCall: Codable, Equatable {
+            var name: String
+            var arguments: String
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case role
+            case name
+            case parts
+            case function_call
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+
+            try container.encode(role, forKey: .role)
+
+            if let name {
+                try container.encode(name, forKey: .name)
+            }
+
+            try container.encode(parts, forKey: .parts)
+
+            if let function_call {
+                try container.encode(function_call, forKey: .function_call)
+            }
+        }
+
+        private func flattenTokens() -> String {
+            let contentArray :[String] = parts.flatMap( { $0.text ?? "" })
+            let content = contentArray.joined()
+            return content
+        }
+        
+        var approximateTokenCount: Int {
+            OpenAIMetadata.instance.tokens(in: flattenTokens()) + 1
+        }
+    }
 
     struct Body: Codable {
         var model: String  // "text-davinci-003"
@@ -503,6 +576,10 @@ class AITermController {
         var temperature = 0
         var functions: [ChatGPTFunctionDeclaration]? = nil
         var function_call: String? = nil  // "none" and "auto" also allowed
+    }
+    
+    struct GeminiBody: Codable {
+        var contents = [GeminiContent]()
     }
 
     private func modernRequestBody(model: String, messages: [Message]) -> Data {
@@ -518,6 +595,20 @@ class AITermController {
         DLog("REQUEST:\n\(body)")
         let bodyEncoder = JSONEncoder()
         let bodyData = try! bodyEncoder.encode(body)
+        print("REQUEST DATA:\n\(bodyData)")
+        return bodyData
+    }
+    
+    private func gemini10RequestBody(model: String, messages: [Message]) -> Data {
+        // Tokens are about 4 letters each. Allow enough tokens to include both the query and an
+        // answer the same length as the query.
+        let query = messages.compactMap { $0.content }.joined(separator: "\n")
+        let maybeDecls = functions.isEmpty ? nil : functions.map { $0.decl }
+        let contents = messages.filter{ $0.content != nil }.map { GeminiContent.init(text: $0.content!) }
+        let body = GeminiBody(contents: contents)
+        print("REQUEST:\n\(body)")
+        let bodyEncoder = JSONEncoder()
+        let bodyData = try! bodyEncoder.encode(body)
         return bodyData
     }
 
@@ -528,43 +619,76 @@ class AITermController {
             return iTermAdvancedSettingsModel.aitermUseLegacyAPI()
         }
     }
-
-    private func requestBody(model: String, messages: [Message]) -> Data {
-        if shouldUseLegacyAPI(model) {
-            return legacyRequestBody(model: model, messages: messages)
+    
+    private func getFormat(_ model: String) -> AIFormat {
+        if usingOpenAI {
+            return openAIModelIsLegacy(model: model) ? .openai_legacy : .openai_modern
+        } else if usingGemini {
+            return .google_gemini_10
+        } else {
+            return iTermAdvancedSettingsModel.aitermUseLegacyAPI() ? .openai_legacy : .openai_modern
         }
-        return modernRequestBody(model: model, messages: messages)
+    }
+    
+    private func getDefaultFormat() -> AIFormat {
+        let model = iTermPreferences.string(forKey: kPreferenceKeyAIModel) ?? "gpt-3.5-turbo"
+        return getFormat(model)
     }
 
-    private func makeAPICall(query: String, registration: Registration) {
-        makeAPICall(messages: [Message(role: "user", content: query)], registration: registration)
+    private func requestBody(model: String, messages: [Message], format: AIFormat) -> Data {
+        switch format {
+        case .openai_legacy:
+            return legacyRequestBody(model: model, messages: messages)
+        case .openai_modern:
+            return modernRequestBody(model: model, messages: messages)
+        case .google_gemini_10:
+            return gemini10RequestBody(model: model, messages: messages)
+        default:
+            return legacyRequestBody(model: model, messages: messages)
+        }
+    }
+
+    private func makeAPICall(query: String, registration: Registration, format: AIFormat) {
+        makeAPICall(messages: [Message(role: "user", content: query)], registration: registration, format: format)
     }
 
     private var modelURL: URL? {
         let model = iTermPreferences.string(forKey: kPreferenceKeyAIModel) ?? "gpt-3.5-turbo"
         return url(forModel: model)
     }
-    private func makeAPICall(messages: [Message], registration: Registration) {
+    
+    private func makeAPICall(messages: [Message], registration: Registration, format: AIFormat) {
         let model = iTermPreferences.string(forKey: kPreferenceKeyAIModel) ?? "gpt-3.5-turbo"
         guard let url = url(forModel: model) else {
-            handle(event: .error(reason: "Invalid URL"), legacy: false)
+            handle(event: .error(reason: "Invalid URL"), format: .openai_modern)
             return
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        let headers = [("Content-Type", "application/json"),
-                       ("Authorization", "Bearer " + registration.apiKey)]
-        for (key, value) in headers {
-            request.addValue(value, forHTTPHeaderField: key)
+        switch format {
+        case .google_gemini_10:
+            let headers = [("Content-Type", "application/json"),
+                           ("x-goog-api-key", registration.apiKey)]
+            for (key, value) in headers {
+                request.addValue(value, forHTTPHeaderField: key)
+            }
+        default:
+            let headers = [("Content-Type", "application/json"),
+                           ("Authorization", "Bearer " + registration.apiKey)]
+            for (key, value) in headers {
+                request.addValue(value, forHTTPHeaderField: key)
+            }
         }
 
-        let bodyData = requestBody(model: model, messages: messages)
+        let bodyData = requestBody(model: model, messages: messages, format: format)
         request.httpBody = bodyData
-        let legacy = shouldUseLegacyAPI(model)
+        print("REQUEST:\n\(request)")
+        print("REQUEST BODY:\n\(bodyData)")
+        let format = getFormat(model)
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 self?.handle(event: .apiResponse(data: data, response: response, error: error),
-                             legacy: legacy)
+                             format: format)
             }
         }
         state = .querySent(messages: messages)
@@ -590,6 +714,16 @@ class AITermController {
             var completion_tokens: Int?
             var total_tokens: Int
         }
+    }
+
+    struct GeminiGenerateContentResponse: Codable {
+        var candidates: [GeminiCandidate]
+
+        struct GeminiCandidate: Codable {
+            var index: Int
+            var content: GeminiContent
+        }
+
     }
 
     struct ErrorResponse: Codable {
@@ -624,9 +758,17 @@ class AITermController {
         }
     }
 
-    private func parseResponse(data: Data, legacy: Bool) {
+    private func parseResponse(data: Data, format: AIFormat) {
         do {
-            let choices = legacy ? try parseLegacyResponse(data: data) : try parseModernResponse(data: data)
+            let choices : [String]?
+            switch format {
+            case .openai_legacy:
+                choices = try parseLegacyResponse(data: data)
+            case .openai_modern:
+                choices = try parseModernResponse(data: data)
+            case .google_gemini_10:
+                choices = try parseGeminiResponse(data: data)
+            }
             if let choices {
                 state = .ground
                 delegate?.aitermController(self, offerChoices: choices)
@@ -635,10 +777,10 @@ class AITermController {
             let decoder = JSONDecoder()
             if let errorResponse = try? decoder.decode(ErrorResponse.self, from: data) {
                 handle(event: .error(reason: errorResponse.error.message),
-                       legacy: legacy)
+                       format: format)
             } else {
                 handle(event: .error(reason: "Failed to decode API response: \(error). Data is: \(data.stringOrHex)"),
-                       legacy: legacy)
+                       format: format)
             }
         }
     }
@@ -670,6 +812,20 @@ class AITermController {
         return choices
     }
 
+    private func parseGeminiResponse(data: Data) throws -> [String]? {
+        let decoder = JSONDecoder()
+        let response =  try decoder.decode(GeminiGenerateContentResponse.self, from: data)
+        print("RESPONSE:\n\(response)")
+        for c in response.candidates {
+            for p in c.content.parts {
+                if p.text != nil {
+                    return [p.text!]
+                }
+            }
+        }
+        return nil
+    }
+
     private func doFunctionCall(_ message: Message, call functionCall: Message.FunctionCall) {
         switch state {
         case .ground, .initialized, .initializedMessages:
@@ -697,7 +853,7 @@ class AITermController {
                     case .failure(let error):
                         DLog("Trouble invoking a ChatGPT function: \(error.localizedDescription)")
                         handle(event: .error(reason: error.localizedDescription),
-                               legacy: false)
+                               format: .openai_modern)
                         return
                     }
                 }
